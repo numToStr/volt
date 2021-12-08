@@ -21,7 +21,7 @@ use std::{
     fmt::Display,
     fs::File,
     io::{BufReader, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     str,
 };
@@ -29,8 +29,8 @@ use std::{
 use base64::decode;
 use clap::ArgMatches;
 use futures::io;
+use isahc::version;
 use lzma_rs::xz_decompress;
-//use lz4_flex;
 use miette::Result;
 use node_semver::{Range, Version};
 use serde::{Deserialize, Deserializer};
@@ -78,7 +78,7 @@ where
     Ok(Lts::deserialize(deserializer)?.into())
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct NodeVersion {
     pub version: Version,
     #[serde(deserialize_with = "deserialize")]
@@ -131,7 +131,7 @@ impl Node {
     pub async fn download(args: &ArgMatches) -> Result<()> {
         match args.subcommand() {
             Some(("use", version)) => {
-                let v: String = String::from(version.value_of("version").unwrap());
+                let v = version.value_of("version").unwrap();
                 use_node_version(v).await;
             }
             Some(("install", versions)) => {
@@ -148,6 +148,22 @@ impl Node {
     }
 }
 
+fn get_node_path(version: &str) -> PathBuf {
+    let version_dir = if cfg!(target_os = "windows") {
+        version.to_string()
+    } else {
+        format!("node-v{}-{}-{}", version, PLATFORM, ARCH)
+    };
+
+    let node_path = dirs::data_dir()
+        .unwrap()
+        .join("volt")
+        .join("node")
+        .join(version_dir);
+
+    node_path
+}
+
 // 32bit macos/linux systems cannot download a version of node >= 10.0.0
 // They stopped making 32bit builds after that version
 // https://nodejs.org/dist/
@@ -161,7 +177,7 @@ async fn download_node_version(versions: Vec<&str>) {
 
     let mirror = "https://nodejs.org/dist";
 
-    let _node_versions: Vec<NodeVersion> = reqwest::get(format!("{}/index.json", mirror))
+    let node_versions: Vec<NodeVersion> = reqwest::get(format!("{}/index.json", mirror))
         .await
         .unwrap()
         .json()
@@ -170,54 +186,72 @@ async fn download_node_version(versions: Vec<&str>) {
 
     for v in versions {
         let mut download_url = format!("{}/", mirror);
-        if v.parse::<Version>().is_ok() {
-            if ARCH == Arch::X86 && (PLATFORM == Os::Macos || PLATFORM == Os::Linux) {
-                let major = v.split('.').next().unwrap().parse::<u8>().unwrap();
 
-                if major >= 10 {
-                    println!("32 bit versions are not available for macos and linux after version 10.0.0!");
-                    return;
+        let version: Option<Version> = if let Ok(ver) = v.parse() {
+            if cfg!(all(unix, target_arch = "X86")) {
+                if ver >= Version::parse("10.0.0").unwrap() {
+                    println!("32 bit versions are not available for MacOS and Linux after version 10.0.0!");
+                    continue;
                 }
             }
+
+            // TODO: Maybe suggest the closest available version if not found?
 
             let mut found = false;
-            for n in &_node_versions {
+            for n in &node_versions {
                 if v == n.version.to_string() {
-                    download_url = format!("{}v{}", download_url, n.version);
-                    found = true;
                     tracing::debug!("found version '{}' with URL '{}'", v, download_url);
+                    found = true;
+                    break;
                 }
             }
 
-            if !found {
-                println!("Unable to find version {}!", v);
-                continue;
-            }
-
-            download_url = if cfg!(target_os = "windows") {
-                format!("{}/win-{}/node.exe", download_url, ARCH)
+            if found {
+                Some(ver)
             } else {
-                format!("{}/node-v{}-{}-{}.tar.xz", download_url, v, PLATFORM, ARCH)
-            };
+                None
+            }
+        } else if let Ok(ver) = v.parse::<Range>() {
+            let max_ver = node_versions
+                .iter()
+                .filter(|x| x.version.satisfies(&ver))
+                .map(|v| v.version.clone())
+                .max();
 
-            tracing::debug!("Got final URL '{}'", download_url);
-        } else if v.parse::<Range>().is_ok() {
-            //
-            // TODO: Handle ranges with special chars like ^10.3
-            //
-
-            if ARCH == Arch::X86 && (PLATFORM == Os::Macos || PLATFORM == Os::Linux) {
-                let major = v.split('.').next().unwrap();
-                if major.parse::<u8>().unwrap() >= 10 {
+            if cfg!(all(unix, target_arch = "X86")) {
+                if Range::parse(">=10").unwrap().allows_any(&ver) {
                     println!("32 bit versions are not available for macos and linux after version 10.0.0!");
-                    return;
+                    continue;
                 }
             }
-            todo!("Need to handle ranges");
+
+            max_ver
         } else {
             println!("Unable to download {} -- not a valid version!", v);
             continue;
+        };
+
+        if version.is_none() {
+            println!("Unable to find version {}!", v);
+            continue;
         }
+
+        let version = version.unwrap();
+
+        download_url = format!("{}v{}/", download_url, version);
+
+        download_url = if cfg!(target_os = "windows") {
+            format!("{}/win-{}/node.exe", download_url, ARCH)
+        } else {
+            format!(
+                "{}node-v{}-{}-{}.tar.xz",
+                download_url, version, PLATFORM, ARCH
+            )
+        };
+
+        println!("\n------------\n{}\n------------\n", download_url);
+
+        println!("Got final URL '{}'", download_url);
 
         let node_path = {
             let datadir = dirs::data_dir().unwrap().join("volt").join("node");
@@ -226,6 +260,7 @@ async fn download_node_version(versions: Vec<&str>) {
             }
             datadir
         };
+
         // Get the name of the directory the tarball unpacks to
         let unpack_loc = if cfg!(target_os = "windows") {
             v // Windows locations are just saved in a folder named after the version number
@@ -241,9 +276,9 @@ async fn download_node_version(versions: Vec<&str>) {
                 .unwrap()
         };
 
-        let node_path = node_path.join(unpack_loc);
-        if node_path.exists() {
-            println!("Node.js v{} is already installed, nothing to do!", v);
+        //let node_path = node_path.join(unpack_loc);
+        if node_path.join(unpack_loc).exists() {
+            println!("Node.js v{} is already installed, nothing to do!", version);
             continue;
         }
 
@@ -252,7 +287,7 @@ async fn download_node_version(versions: Vec<&str>) {
         // The name of the file we're downloading from the mirror
         let fname = download_url.split('/').last().unwrap().to_string();
 
-        println!("Installing version {} from {} ", v, download_url);
+        println!("Installing version {} from {} ", version, download_url);
         println!("file to download: '{}'", fname);
 
         let response = reqwest::get(&download_url).await.unwrap();
@@ -260,54 +295,57 @@ async fn download_node_version(versions: Vec<&str>) {
         let content = response.bytes().await.unwrap();
 
         if cfg!(target_os = "windows") {
+            println!("Installing node.exe");
             fs::create_dir_all(&node_path).await.unwrap();
             let mut dest = File::create(node_path.join(&fname)).unwrap();
             dest.write_all(&content).unwrap();
         } else {
-            // TODO: Need to use https://github.com/fpgaminer/rust-lzma on linux
-            // (if liblzma is widely available on distros) since it's way faster than
-            // lzma_rs, but depends on the native lzma library being installed.
-            // Need to check if `brew install xzip` will install it on osx, I think so.
+            // path to write the download to
+            let xzip = dir.path().join(&fname);
 
-            // File to write the download to
-            let mut dest = File::create(dir.path().join(&fname)).unwrap();
+            // Path to write the decompressed tarball to
+            let tar = &dir.path().join(&fname.strip_suffix(".xz").unwrap());
 
-            // File to write the decompressed tarball to
-            let mut tarball =
-                File::create(dir.path().join(&fname.strip_suffix(".xz").unwrap())).unwrap();
+            println!("Unzipping...");
 
-            dest.write_all(&content).unwrap();
+            println!("Tar path: {:?}", tar);
 
-            xz_decompress(
-                &mut BufReader::new(File::open(dir.path().join(&fname)).unwrap()),
-                &mut tarball,
-            )
-            .unwrap();
+            let mut tarball = File::create(tar).unwrap();
+            tarball
+                .write_all(&lzma::decompress(&content).unwrap())
+                .unwrap();
 
             // Make sure the first file handle is closed
             drop(tarball);
 
             // Have to reopen it for reading, File::create() opens for write only
-            let tarball = File::open(dir.path().join(&fname.strip_suffix(".xz").unwrap())).unwrap();
+            let tarball = File::open(tar).unwrap();
 
-            // Unpack the tarball to the right spot
-            let mut ar = tar::Archive::new(tarball);
-            ar.unpack(node_path).unwrap();
+            println!("Unpacking...");
+
+            // Unpack the tarball
+            tar::Archive::new(tarball).unpack(node_path).unwrap();
+
+            // Using lzma-rs instead:
+            /*
+             * // Path to write the xz file to
+             * let mut dest = File::create(xzip).unwrap();
+             *
+             *lzma_rs::xz_decompress(
+             *    &mut BufReader::new(File::open(dir.path().join(&fname)).unwrap()),
+             *    &mut tarball,
+             *)
+             *.unwrap();
+             */
         }
 
-        println!("\n---\n");
+        println!("Done!");
     }
 }
 
 async fn remove_node_version(versions: Vec<&str>) {
     for version in versions {
-        let node_path = dirs::data_dir()
-            .unwrap()
-            .join("volt")
-            .join("node")
-            .join(version);
-
-        println!("{}", node_path.display());
+        let node_path = get_node_path(version);
 
         if node_path.exists() {
             fs::remove_dir_all(&node_path).await.unwrap();
@@ -329,6 +367,7 @@ async fn use_windows(version: String) {
         homedir.display(),
         version
     );
+
     let path = Path::new(&node_path);
 
     if path.exists() {
@@ -367,77 +406,53 @@ async fn use_windows(version: String) {
     }
 }
 
-async fn use_node_version(version: String) {
+async fn use_node_version(version: &str) {
     if PLATFORM == Os::Windows {
         #[cfg(target_os = "windows")]
         use_windows(version).await;
     } else if PLATFORM == Os::Linux {
-        let homedir = dirs::home_dir().unwrap();
-        let node_path = format!("{}/.volt/Node/{}/node", homedir.display(), version);
-        let path = Path::new(&node_path);
+        //
+        // TODO: Need to make a link to the current "used" version of node so we can "undo" it
+        //
+        // TODO: Once set up a current link, check if current exists before overwriting/deleting existing entries in .local/bin
+        //
+        // TODO: On node remove, check if that version is being used and remove the symlinks
+        //
 
-        if path.exists() {
-            let link_dir = format!("{}/.local/bin", homedir.display());
-            let link = format!("{}/{}", link_dir, "node.exe");
-            //let symlink = std::os::unix::fs::symlink(node_path, link);
+        let node_path = get_node_path(version);
+
+        if node_path.exists() {
+            /*
+             *            let cur = dirs::data_dir()
+             *                .unwrap()
+             *                .join("volt")
+             *                .join("node")
+             *                .join("current");
+             *
+             *            if cur.exists() {
+             *                // unlink all the currently installed files
+             *            }
+             */
+
+            let link_dir = dirs::home_dir().unwrap().join(".local").join("bin");
+            let npm = node_path.join("bin").join("npm");
+            let ld = link_dir.join("npm");
+
+            let current = node_path.join("bin");
+
+            for f in std::fs::read_dir(&current).unwrap() {
+                let original = f.unwrap().path();
+                let fname = original.file_name().unwrap();
+                let link = link_dir.join(fname);
+
+                println!("Linking to {:?} from {:?}", link, original);
+
+                std::fs::remove_file(&link);
+
+                let symlink = std::os::unix::fs::symlink(original, link).unwrap();
+            }
         } else {
-            println!("That version of node is not installed!\nTry \"volt node install {}\" to install that version.", version)
+            println!("That version of node is not installed!\nTry \"volt node install {}\" to install that version.", version);
         }
     }
 }
-
-/*#[async_trait]
-  impl Command for Node {
-/// Display a help menu for the `volt add` command.
-fn help() -> String {
-format!(
-r#"volt {}
-
-Manage NodeJS versions
-Usage: {} {} {} {}
-Options:
-
-{} {} Output the version number.
-{} {} Output verbose messages on internal operations.
-{} {} Adds package as a dev dependency
-{} {} Disable progress bar."#,
-VERSION.bright_green().bold(),
-"volt".bright_green().bold(),
-"add".bright_purple(),
-"[packages]".white(),
-"[flags]".white(),
-"--version".blue(),
-"(-ver)".yellow(),
-"--verbose".blue(),
-"(-v)".yellow(),
-"--dev".blue(),
-"(-D)".yellow(),
-"--no-progress".blue(),
-"(-np)".yellow()
-)
-}
-
-/// Execute the `volt node` command
-///
-/// Adds a package to dependencies for your project.
-/// ## Arguments
-/// * `app` - Instance of the command (`Arc<App>`)
-/// ## Examples
-/// ```rust
-/// // Add react to your dependencies with logging level verbose
-/// // .exec() is an async call so you need to await it
-/// Add.exec(app).await;
-/// ```
-/// ## Returns
-/// * `Result<()>`
-async fn exec(app: Arc<App>) -> Result<()> {
-println!("In Node Exec!");
-let x = app.get_packages();
-let x = x.unwrap();
-for a in x {
-println!("{:?}", a);
-break;
-}
-Ok(())
-}
-}*/

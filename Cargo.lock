@@ -2217,6 +2217,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-lzma"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "895dc04daeaeee338bb96e229797902ed3f0675bfc59d5b42e0f0b0c13ac54da"
+dependencies = [
+ "pkg-config",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3096,6 +3105,7 @@ dependencies = [
  "rslint_rowan",
  "rslint_syntax",
  "rslint_text_edit",
+ "rust-lzma",
  "scopeguard",
  "semver_rs",
  "serde",
